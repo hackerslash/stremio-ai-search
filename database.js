@@ -1,13 +1,19 @@
 const { open } = require("sqlite");
 const sqlite3 = require("sqlite3");
+const path = require("path");
 const logger = require("./utils/logger");
 
 let db;
+const DB_PATH =
+  process.env.TRAKT_DB_PATH ||
+  (process.env.VERCEL === "1"
+    ? path.join("/tmp", "trakt_tokens.db")
+    : path.join(__dirname, "trakt_tokens.db"));
 
 async function initDb() {
   try {
     db = await open({
-      filename: "./trakt_tokens.db",
+      filename: DB_PATH,
       driver: sqlite3.Database,
     });
 
@@ -33,10 +39,10 @@ async function initDb() {
       END;
     `);
 
-    logger.info("Database initialized successfully.");
+    logger.info("Database initialized successfully.", { dbPath: DB_PATH });
   } catch (error) {
     logger.error("Failed to initialize database", { error: error.message, stack: error.stack });
-    process.exit(1); // Exit if DB fails to initialize
+    throw error;
   }
 }
 
@@ -44,6 +50,10 @@ async function initDb() {
  * Stores or updates Trakt tokens for a user.
  */
 async function storeTokens(username, accessToken, refreshToken, expiresIn) {
+  if (!db) {
+    logger.error("Database not initialized; cannot store tokens", { username });
+    return;
+  }
   const expiresAt = Date.now() + expiresIn * 1000;
   try {
     await db.run(
@@ -65,6 +75,10 @@ async function storeTokens(username, accessToken, refreshToken, expiresIn) {
  * Retrieves Trakt tokens for a user.
  */
 async function getTokens(username) {
+  if (!db) {
+    logger.error("Database not initialized; cannot get tokens", { username });
+    return null;
+  }
   try {
     const tokenData = await db.get("SELECT * FROM tokens WHERE trakt_username = ?", [username]);
     if (tokenData) {

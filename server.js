@@ -12,7 +12,7 @@ process.on("warning", (warning) => {
 try {
   require("dotenv").config();
 } catch (error) {
-  logger.warn("dotenv module not found, continuing without .env file support");
+  console.warn("dotenv module not found, continuing without .env file support");
 }
 
 const { serveHTTP } = require("stremio-addon-sdk");
@@ -31,17 +31,37 @@ const {
 } = require("./utils/crypto");
 const zlib = require("zlib");
 const { initDb, storeTokens, getTokens } = require("./database");
+const IS_VERCEL = process.env.VERCEL === "1";
 
 // Admin token for cache management
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "change-me-in-env-file";
 
 // Cache persistence configuration
 const CACHE_BACKUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
-const CACHE_FOLDER = path.join(__dirname, "cache_data");
+const ENABLE_CACHE_PERSISTENCE =
+  process.env.ENABLE_CACHE_PERSISTENCE !== undefined
+    ? process.env.ENABLE_CACHE_PERSISTENCE === "true"
+    : !IS_VERCEL;
+const CACHE_FOLDER =
+  process.env.CACHE_FOLDER ||
+  (IS_VERCEL
+    ? path.join("/tmp", "stremio-ai-search-cache")
+    : path.join(__dirname, "cache_data"));
+let cachePersistenceEnabled = ENABLE_CACHE_PERSISTENCE;
 
 // Ensure cache folder exists
-if (!fs.existsSync(CACHE_FOLDER)) {
-  fs.mkdirSync(CACHE_FOLDER, { recursive: true });
+if (cachePersistenceEnabled) {
+  try {
+    if (!fs.existsSync(CACHE_FOLDER)) {
+      fs.mkdirSync(CACHE_FOLDER, { recursive: true });
+    }
+  } catch (error) {
+    logger.warn("Cache persistence unavailable; continuing in memory only", {
+      cacheFolder: CACHE_FOLDER,
+      error: error.message,
+    });
+    cachePersistenceEnabled = false;
+  }
 }
 
 // Function to validate admin token
@@ -59,6 +79,12 @@ const validateAdminToken = (req, res, next) => {
 
 // Function to save all caches to files
 async function saveCachesToFiles() {
+  if (!cachePersistenceEnabled) {
+    return {
+      success: false,
+      reason: "Cache persistence disabled",
+    };
+  }
   try {
     const { serializeAllCaches } = require("./addon");
     const allCaches = serializeAllCaches();
@@ -144,6 +170,12 @@ async function saveCachesToFiles() {
 
 // Function to load caches from files
 async function loadCachesFromFiles() {
+  if (!cachePersistenceEnabled) {
+    return {
+      success: false,
+      reason: "Cache persistence disabled",
+    };
+  }
   try {
     // Check if cache folder exists
     if (!fs.existsSync(CACHE_FOLDER)) {
@@ -298,6 +330,8 @@ if (ENABLE_LOGGING) {
 const PORT = 6295;
 const HOST = process.env.HOST
   ? `https://${process.env.HOST}`
+  : process.env.VERCEL_URL
+    ? `https://${process.env.VERCEL_URL}`
   : "https://stremio.itcon.au";
 const BASE_PATH = "/aisearch";
 
@@ -346,7 +380,8 @@ const getConfiguredManifest = (geminiKey, tmdbKey) => ({
   ],
 });
 
-async function startServer() {
+async function startServer(options = {}) {
+  const { listen = true } = options;
   try {
     await initDb();
     // Load caches from files on startup
@@ -356,44 +391,47 @@ async function startServer() {
     const purgeStats = purgeEmptyAiCacheEntries();
     logger.info("Empty AI cache purge complete.", { purged: purgeStats.purged, remaining: purgeStats.remaining });
 
-    // Set up periodic cache saving
-    setInterval(async () => {
-      await saveCachesToFiles();
-    }, CACHE_BACKUP_INTERVAL_MS);
-
-    // Set up graceful shutdown handlers
-    const gracefulShutdown = async (signal) => {
-      logger.info(`Received ${signal}. Starting graceful shutdown...`);
-
-      try {
-        logger.info("Saving all caches and stats before shutdown...");
-        const result = await saveCachesToFiles();
-        logger.info("Cache save completed", { result });
-      } catch (error) {
-        logger.error("Error saving caches during shutdown", {
-          error: error.message,
-          stack: error.stack,
-        });
+    if (listen) {
+      // Set up periodic cache saving
+      if (cachePersistenceEnabled) {
+        setInterval(async () => {
+          await saveCachesToFiles();
+        }, CACHE_BACKUP_INTERVAL_MS);
       }
 
-      logger.info("Graceful shutdown completed. Exiting process.");
-      process.exit(0);
-    };
+      // Set up graceful shutdown handlers
+      const gracefulShutdown = async (signal) => {
+        logger.info(`Received ${signal}. Starting graceful shutdown...`);
 
-    // Register shutdown handlers for different signals
-    process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-    process.on("SIGINT", () => gracefulShutdown("SIGINT"));
-    process.on("SIGHUP", () => gracefulShutdown("SIGHUP"));
+        try {
+          logger.info("Saving all caches and stats before shutdown...");
+          const result = await saveCachesToFiles();
+          logger.info("Cache save completed", { result });
+        } catch (error) {
+          logger.error("Error saving caches during shutdown", {
+            error: error.message,
+            stack: error.stack,
+          });
+        }
+
+        logger.info("Graceful shutdown completed. Exiting process.");
+        process.exit(0);
+      };
+
+      // Register shutdown handlers for different signals
+      process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+      process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+      process.on("SIGHUP", () => gracefulShutdown("SIGHUP"));
+    }
 
     if (!process.env.ENCRYPTION_KEY || process.env.ENCRYPTION_KEY.length < 32) {
-      logger.error(
-        "CRITICAL ERROR: ENCRYPTION_KEY environment variable is missing or too short!"
-      );
-      logger.error("The ENCRYPTION_KEY must be at least 32 characters long.");
-      logger.error(
-        "Please set this environment variable before starting the server."
-      );
-      process.exit(1);
+      const message =
+        "ENCRYPTION_KEY environment variable is missing or too short (minimum 32 chars).";
+      logger.error(message);
+      if (listen) {
+        process.exit(1);
+      }
+      throw new Error(message);
     }
 
     const app = express();
@@ -1739,29 +1777,33 @@ app.post(["/validate", "/aisearch/validate"], express.json(), async (req, res) =
       }
     );
 
-    app.listen(PORT, "0.0.0.0", () => {
-      if (ENABLE_LOGGING) {
-        logger.info("Server started", {
-          environment: "production",
-          port: PORT,
-          urls: {
-            base: HOST,
-            manifest: `${HOST}${BASE_PATH}/manifest.json`,
-            configure: `${HOST}${BASE_PATH}/configure`,
-          },
-          addon: {
-            id: setupManifest.id,
-            version: setupManifest.version,
-            name: setupManifest.name,
-          },
-          static: {
-            publicDir: path.join(__dirname, "public"),
-            logo: setupManifest.logo,
-            background: setupManifest.background,
-          },
-        });
-      }
-    });
+    if (listen) {
+      app.listen(PORT, "0.0.0.0", () => {
+        if (ENABLE_LOGGING) {
+          logger.info("Server started", {
+            environment: "production",
+            port: PORT,
+            urls: {
+              base: HOST,
+              manifest: `${HOST}${BASE_PATH}/manifest.json`,
+              configure: `${HOST}${BASE_PATH}/configure`,
+            },
+            addon: {
+              id: setupManifest.id,
+              version: setupManifest.version,
+              name: setupManifest.name,
+            },
+            static: {
+              publicDir: path.join(__dirname, "public"),
+              logo: setupManifest.logo,
+              background: setupManifest.background,
+            },
+          });
+        }
+      });
+    }
+
+    return app;
   } catch (error) {
     if (ENABLE_LOGGING) {
       logger.error("Server error:", {
@@ -1769,8 +1811,27 @@ app.post(["/validate", "/aisearch/validate"], express.json(), async (req, res) =
         stack: error.stack,
       });
     }
-    process.exit(1);
+    if (listen) {
+      process.exit(1);
+    }
+    throw error;
   }
 }
 
-startServer();
+let appPromise = null;
+
+async function getApp() {
+  if (!appPromise) {
+    appPromise = startServer({ listen: false });
+  }
+  return appPromise;
+}
+
+if (require.main === module) {
+  startServer({ listen: true });
+}
+
+module.exports = {
+  getApp,
+  startServer,
+};

@@ -3,11 +3,29 @@ const path = require("path");
 
 // Use environment variable for logging
 const ENABLE_LOGGING = process.env.ENABLE_LOGGING === "true" || false;
+const IS_VERCEL = process.env.VERCEL === "1";
+const LOG_TO_FILES =
+  process.env.LOG_TO_FILES !== undefined
+    ? process.env.LOG_TO_FILES === "true"
+    : !IS_VERCEL;
 
-// Create logs directory if it doesn't exist (always create it for query logging)
-const logsDir = path.join(__dirname, "..", "logs");
-if (!fs.existsSync(logsDir)) {
-  fs.mkdirSync(logsDir, { recursive: true });
+// Create logs directory if file logging is enabled
+const logsDir =
+  process.env.LOG_DIR ||
+  (IS_VERCEL
+    ? path.join("/tmp", "stremio-ai-search-logs")
+    : path.join(__dirname, "..", "logs"));
+let fileLoggingEnabled = LOG_TO_FILES;
+
+if (fileLoggingEnabled) {
+  try {
+    if (!fs.existsSync(logsDir)) {
+      fs.mkdirSync(logsDir, { recursive: true });
+    }
+  } catch (error) {
+    fileLoggingEnabled = false;
+    console.warn(`File logging disabled: ${error.message}`);
+  }
 }
 
 // Keep track of last query and timestamp to prevent duplicates
@@ -27,12 +45,10 @@ function writeLog(level, message, data) {
   const formattedData = data ? `\n${JSON.stringify(data, null, 2)}` : "";
   const logMessage = `[${timestamp}] ${level}: ${message}${formattedData}\n`;
 
-  // Write to file
-  fs.appendFile(
-    path.join(logsDir, "app.log"),
-    logMessage,
-    () => {} // Silent error handling
-  );
+  // Write to file when enabled
+  if (fileLoggingEnabled) {
+    fs.appendFile(path.join(logsDir, "app.log"), logMessage, () => {});
+  }
 
   // Mirror logs to terminal when logging is enabled
   if (ENABLE_LOGGING) {
@@ -93,11 +109,13 @@ function logQuery(query) {
   const logLine = `${getMelbourneTime()}|${query}\n`;
 
   // Write to query log file with error handling
-  fs.appendFile(path.join(logsDir, "query.log"), logLine, (err) => {
-    if (err) {
-      console.error("Error writing to query.log:", err);
-    }
-  });
+  if (fileLoggingEnabled) {
+    fs.appendFile(path.join(logsDir, "query.log"), logLine, (err) => {
+      if (err) {
+        console.error("Error writing to query.log:", err);
+      }
+    });
+  }
 
   if (ENABLE_LOGGING) {
     console.info(`[${new Date().toISOString()}] QUERY: ${query}`);
@@ -115,11 +133,9 @@ function logEmptyCatalog(query, data = {}) {
   const logMessage = `[${timestamp}] EMPTY_CATALOG: Query "${query}" returned no results\n${formattedData}\n`;
 
   // Write to error log file
-  fs.appendFile(
-    path.join(logsDir, "error.log"),
-    logMessage,
-    () => {} // Silent error handling
-  );
+  if (fileLoggingEnabled) {
+    fs.appendFile(path.join(logsDir, "error.log"), logMessage, () => {});
+  }
 
   if (ENABLE_LOGGING) {
     console.warn(`[${timestamp}] EMPTY_CATALOG: Query "${query}" returned no results`, data);
@@ -182,11 +198,9 @@ const logger = {
     const logMessage = `[${timestamp}] EMPTY_CATALOG: ${reason}\n${formattedData}\n`;
 
     // Write to error log file
-    fs.appendFile(
-      path.join(logsDir, "error.log"),
-      logMessage,
-      () => {} // Silent error handling
-    );
+    if (fileLoggingEnabled) {
+      fs.appendFile(path.join(logsDir, "error.log"), logMessage, () => {});
+    }
 
     if (ENABLE_LOGGING) {
       console.warn(`[${timestamp}] EMPTY_CATALOG: ${reason}`, data);

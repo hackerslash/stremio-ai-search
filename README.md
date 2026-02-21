@@ -454,6 +454,19 @@ Here are some examples showing how versatile this addon is.
 
 ## Self Hosting
 
+### Deploy on Vercel
+
+1. Import this repository into Vercel.
+2. Set Framework Preset to `Other`.
+3. Add the required environment variables from the section below.
+4. Deploy.
+5. Open `https://<your-vercel-domain>/aisearch/configure`.
+
+Notes for Vercel:
+- This project runs as a Node serverless function via `api/index.js`.
+- `HOST` should be your production domain (without protocol), for example `my-addon.example.com`.
+- File-based caches and SQLite token storage are ephemeral on Vercel. By default this deployment runs in-memory + `/tmp` only.
+
 ### Environment Variables
 
 When self-hosting the addon, you can configure the following environment variables in a `.env` file:
@@ -467,6 +480,11 @@ When self-hosting the addon, you can configure the following environment variabl
 - `GITHUB_TOKEN` - GitHub token for issue submission
 - `RECAPTCHA_SECRET_KEY` - Secret key for reCAPTCHA
 - `ADMIN_TOKEN` - Token required for accessing cache management endpoints (new)
+- `ENABLE_CACHE_PERSISTENCE` - Set to `"true"` to persist cache files to disk (defaults to `false` on Vercel)
+- `CACHE_FOLDER` - Optional path for cache persistence files
+- `TRAKT_DB_PATH` - Optional SQLite path for Trakt token storage (defaults to `/tmp/trakt_tokens.db` on Vercel)
+- `LOG_TO_FILES` - Set to `"true"` to write logs to files (defaults to `false` on Vercel)
+- `LOG_DIR` - Optional path for file logs
 
 ### Admin Endpoints
 
