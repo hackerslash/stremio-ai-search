@@ -8,7 +8,7 @@ module.exports = {
       cwd: ".",
       env: {
         NODE_ENV: "production",
-        PORT: 7000,
+        PORT: 6295,
       },
       max_memory_restart: "1999M",
       instances: 1, // Changed to 1 instance to avoid port conflicts

@@ -600,6 +600,30 @@
             </div>
           </div>
 
+          <div class="form-group">
+            <div class="checkbox-container">
+              <input type="checkbox" id="enableWebSearch" checked />
+              <label for="enableWebSearch">Enable Web Search Grounding</label>
+              <span
+                class="info-tooltip"
+                title="Allows Gemini to ground responses with live web search for freshness"
+                >ⓘ</span
+              >
+            </div>
+          </div>
+
+          <div class="form-group">
+            <div class="checkbox-container">
+              <input type="checkbox" id="enableContextGathering" checked />
+              <label for="enableContextGathering">Enable Context Gathering</label>
+              <span
+                class="info-tooltip"
+                title="Collects additional TMDB context before AI generation to improve relevance"
+                >ⓘ</span
+              >
+            </div>
+          </div>
+
           <!-- Adult recommendations -->
           <div class="form-group">
             <div class="checkbox-container">
@@ -1145,6 +1169,8 @@
             FanartApiKey: document.getElementById("fanartKey").value.trim(),
             NumResults: parseInt(document.getElementById("numResults").value.trim()) || 20,
             EnableAiCache: document.getElementById("enableAiCache").checked,
+            EnableWebSearch: document.getElementById("enableWebSearch").checked,
+            EnableContextGathering: document.getElementById("enableContextGathering").checked,
             TmdbLanguage: document.getElementById("tmdbLanguage").value,
             GeminiModel: document.getElementById("geminiModel").value,
             EnableRpdb: document.getElementById("enableRpdbPosters").checked,
@@ -1449,6 +1475,12 @@
               if (config.EnableAiCache !== undefined)
                 document.getElementById("enableAiCache").checked =
                   config.EnableAiCache;
+              if (config.EnableWebSearch !== undefined)
+                document.getElementById("enableWebSearch").checked =
+                  config.EnableWebSearch;
+              if (config.EnableContextGathering !== undefined)
+                document.getElementById("enableContextGathering").checked =
+                  config.EnableContextGathering;
               if (config.GeminiModel)
                 document.getElementById("geminiModel").value =
                   config.GeminiModel;
@@ -1502,6 +1534,8 @@
                 config.RpdbApiKey ||
                 config.NumResults ||
                 config.EnableAiCache !== undefined ||
+                config.EnableWebSearch !== undefined ||
+                config.EnableContextGathering !== undefined ||
                 config.TraktAccessToken ||
                 config.GeminiModel ||
                 config.EnableRpdb // Check the new flag too

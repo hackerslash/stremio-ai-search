@@ -295,7 +295,7 @@ if (ENABLE_LOGGING) {
   logger.info("Logging enabled via ENABLE_LOGGING environment variable");
 }
 
-const PORT = 7000;
+const PORT = 6295;
 const HOST = process.env.HOST
   ? `https://${process.env.HOST}`
   : "https://stremio.itcon.au";
@@ -883,7 +883,9 @@ async function startServer() {
       });
 
       // Handle configuration editing with encrypted config
-      addonRouter.get(routePath + ":encryptedConfig/configure", (req, res) => {
+      addonRouter.get(
+        routePath + ":encryptedConfig([A-Za-z0-9_-]{10,})/configure",
+        (req, res) => {
         const { encryptedConfig } = req.params;
 
         if (!encryptedConfig || !isValidEncryptedFormat(encryptedConfig)) {
@@ -920,7 +922,8 @@ async function startServer() {
 
           res.send(modifiedHtml);
         });
-      });
+        }
+      );
 
       // Update the getConfig endpoint to handle the full path
       addonRouter.get(routePath + "api/getConfig/:configId", (req, res) => {
@@ -1376,8 +1379,10 @@ async function startServer() {
       });
     });
 
-    app.use("/", addonRouter);
+    // Mount BASE_PATH first so "/aisearch/*" routes are resolved against
+    // the intended addon paths before the root-mounted dynamic routes.
     app.use(BASE_PATH, addonRouter);
+    app.use("/", addonRouter);
 
     app.post(["/encrypt", "/aisearch/encrypt"], express.json(), async (req, res) => {
       try {
@@ -1517,11 +1522,21 @@ app.post(["/validate", "/aisearch/validate"], express.json(), async (req, res) =
     if (GeminiApiKey) {
       validations.push((async () => {
         try {
-          const { GoogleGenerativeAI } = require("@google/generative-ai");
-          const genAI = new GoogleGenerativeAI(GeminiApiKey);
-          const model = genAI.getGenerativeModel({ model: modelToUse });
-          const result = await model.generateContent("Test prompt");
-          const responseText = result.response.text();
+          const { GoogleGenAI } = require("@google/genai");
+          const ai = new GoogleGenAI({ apiKey: GeminiApiKey });
+          const result = await ai.models.generateContent({
+            model: modelToUse,
+            contents: "Test prompt",
+          });
+
+          const responseText =
+            typeof result?.text === "function"
+              ? result.text()
+              : typeof result?.text === "string"
+                ? result.text
+                : result?.candidates?.[0]?.content?.parts
+                    ?.map((part) => (typeof part?.text === "string" ? part.text : ""))
+                    .join("\n") || "";
           if (responseText.length > 0) {
             validationResults.gemini = true;
           } else {

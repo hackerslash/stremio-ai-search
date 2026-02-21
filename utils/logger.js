@@ -33,6 +33,24 @@ function writeLog(level, message, data) {
     logMessage,
     () => {} // Silent error handling
   );
+
+  // Mirror logs to terminal when logging is enabled
+  if (ENABLE_LOGGING) {
+    const consoleLine = `[${timestamp}] ${level}: ${message}`;
+    if (level === "ERROR") {
+      if (data !== undefined) console.error(consoleLine, data);
+      else console.error(consoleLine);
+    } else if (level === "WARN") {
+      if (data !== undefined) console.warn(consoleLine, data);
+      else console.warn(consoleLine);
+    } else if (level === "DEBUG") {
+      if (data !== undefined) console.debug(consoleLine, data);
+      else console.debug(consoleLine);
+    } else {
+      if (data !== undefined) console.info(consoleLine, data);
+      else console.info(consoleLine);
+    }
+  }
 }
 
 /**
@@ -80,6 +98,10 @@ function logQuery(query) {
       console.error("Error writing to query.log:", err);
     }
   });
+
+  if (ENABLE_LOGGING) {
+    console.info(`[${new Date().toISOString()}] QUERY: ${query}`);
+  }
 }
 
 /**
@@ -98,9 +120,13 @@ function logEmptyCatalog(query, data = {}) {
     logMessage,
     () => {} // Silent error handling
   );
+
+  if (ENABLE_LOGGING) {
+    console.warn(`[${timestamp}] EMPTY_CATALOG: Query "${query}" returned no results`, data);
+  }
 }
 
-// Simplified logger without console logs, only file logging
+// Logger writes to files and mirrors to console when ENABLE_LOGGING is true
 const logger = {
   debug: function (message, data) {
     if (ENABLE_LOGGING) {
@@ -161,6 +187,10 @@ const logger = {
       logMessage,
       () => {} // Silent error handling
     );
+
+    if (ENABLE_LOGGING) {
+      console.warn(`[${timestamp}] EMPTY_CATALOG: ${reason}`, data);
+    }
   },
   ENABLE_LOGGING,
 };

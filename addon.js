@@ -1,5 +1,5 @@
 const { addonBuilder } = require("stremio-addon-sdk");
-const { GoogleGenerativeAI, GoogleSearch } = require("@google/generative-ai");
+const { GoogleGenAI } = require("@google/genai");
 const fetch = require("node-fetch").default;
 const logger = require("./utils/logger");
 const path = require("path");
@@ -186,7 +186,7 @@ const similarContentCache = new SimpleLRUCache({
 const HOST = process.env.HOST
   ? `https://${process.env.HOST}`
   : "https://stremio.itcon.au";
-const PORT = 7000;
+const PORT = 6295;
 const BASE_PATH = "/aisearch";
 
 setInterval(() => {
@@ -241,6 +241,390 @@ setInterval(() => {
 }, 60 * 60 * 1000);
 
 const DEFAULT_GEMINI_MODEL = "gemini-2.0-flash-lite";
+const DEFAULT_ENABLE_WEB_SEARCH = true;
+const DEFAULT_ENABLE_CONTEXT_GATHERING = true;
+
+function extractGenAIResponseText(response) {
+  if (!response) return "";
+
+  if (typeof response.text === "string") {
+    return response.text.trim();
+  }
+
+  if (typeof response.text === "function") {
+    try {
+      const text = response.text();
+      if (typeof text === "string") {
+        return text.trim();
+      }
+    } catch (error) {
+      logger.warn("Failed reading GenAI response text() helper", {
+        error: error.message,
+      });
+    }
+  }
+
+  const parts = response.candidates?.[0]?.content?.parts;
+  if (Array.isArray(parts)) {
+    return parts
+      .map((part) => (typeof part?.text === "string" ? part.text : ""))
+      .join("\n")
+      .trim();
+  }
+
+  return "";
+}
+
+function extractGroundingSources(response) {
+  const candidates = Array.isArray(response?.candidates)
+    ? response.candidates
+    : [];
+  const seen = new Set();
+  const sources = [];
+
+  for (const candidate of candidates) {
+    const chunks = candidate?.groundingMetadata?.groundingChunks;
+    if (!Array.isArray(chunks)) continue;
+
+    for (const chunk of chunks) {
+      const uri = chunk?.web?.uri;
+      if (!uri || seen.has(uri)) continue;
+      seen.add(uri);
+      sources.push({
+        title: chunk?.web?.title || "Untitled",
+        uri,
+      });
+    }
+  }
+
+  return sources;
+}
+
+function shouldFallbackWithoutWebSearch(error) {
+  const message = (error?.message || "").toLowerCase();
+  return (
+    message.includes("googlesearch") ||
+    message.includes("tool") ||
+    message.includes("unknown field") ||
+    message.includes("unsupported") ||
+    message.includes("invalid argument") ||
+    message.includes("invalid_argument")
+  );
+}
+
+async function generateTextWithGenAI({
+  apiKey,
+  model,
+  promptText,
+  enableWebSearch = false,
+  operationName = "GenAI API call",
+  maxRetries = 3,
+  initialDelay = 2000,
+  maxDelay = 10000,
+}) {
+  const ai = new GoogleGenAI({ apiKey });
+
+  const callModel = async (useWebSearch) => {
+    const request = {
+      model,
+      contents: promptText,
+    };
+
+    if (useWebSearch) {
+      request.config = {
+        tools: [{ googleSearch: {} }],
+      };
+    }
+
+    return ai.models.generateContent(request);
+  };
+
+  const result = await withRetry(
+    async () => {
+      try {
+        const response = await callModel(enableWebSearch);
+        return {
+          response,
+          usedWebSearch: enableWebSearch,
+        };
+      } catch (error) {
+        const status = error?.status || error?.httpStatus;
+        if (status) {
+          error.status = status;
+        }
+
+        if (enableWebSearch && shouldFallbackWithoutWebSearch(error)) {
+          logger.warn(
+            "Web search tool call failed, retrying without web search",
+            {
+              operationName,
+              error: error.message,
+            }
+          );
+          const fallbackResponse = await callModel(false);
+          return {
+            response: fallbackResponse,
+            usedWebSearch: false,
+          };
+        }
+
+        throw error;
+      }
+    },
+    {
+      maxRetries,
+      initialDelay,
+      maxDelay,
+      shouldRetry: (error) => !error.status || error.status !== 400,
+      operationName,
+    }
+  );
+
+  const text = extractGenAIResponseText(result.response);
+  if (!text) {
+    throw new Error("GenAI returned an empty response");
+  }
+
+  const groundingSources = extractGroundingSources(result.response);
+  return {
+    text,
+    groundingSources,
+    usedWebSearch: result.usedWebSearch,
+  };
+}
+
+function extractYearHintsFromQuery(query) {
+  const currentYear = new Date().getFullYear();
+  const years = new Set();
+
+  const explicitYearMatches = query.match(/\b(19\d{2}|20\d{2}|21\d{2})\b/g);
+  if (explicitYearMatches) {
+    explicitYearMatches.forEach((year) => years.add(parseInt(year, 10)));
+  }
+
+  const rangeMatches = query.match(
+    /\b(19\d{2}|20\d{2}|21\d{2})\s*-\s*(19\d{2}|20\d{2}|21\d{2})\b/g
+  );
+  if (rangeMatches) {
+    for (const range of rangeMatches) {
+      const [start, end] = range.split("-").map((y) => parseInt(y.trim(), 10));
+      if (!isNaN(start) && !isNaN(end)) {
+        const from = Math.min(start, end);
+        const to = Math.max(start, end);
+        const span = to - from;
+
+        if (span <= 5) {
+          for (let year = from; year <= to; year++) years.add(year);
+        } else {
+          years.add(from);
+          years.add(to);
+        }
+      }
+    }
+  }
+
+  const normalizedQuery = query.toLowerCase();
+  if (years.size === 0) {
+    if (/\b(new|latest|this year|current year)\b/.test(normalizedQuery)) {
+      years.add(currentYear);
+    } else if (/\b(last year|past year)\b/.test(normalizedQuery)) {
+      years.add(currentYear);
+      years.add(currentYear - 1);
+    } else if (/\brecent\b/.test(normalizedQuery)) {
+      years.add(currentYear);
+      years.add(currentYear - 1);
+      years.add(currentYear - 2);
+    }
+  }
+
+  return Array.from(years)
+    .filter((year) => year >= 1900 && year <= currentYear + 1)
+    .sort((a, b) => b - a)
+    .slice(0, 4);
+}
+
+async function fetchTmdbDiscoverByYear(
+  type,
+  year,
+  tmdbKey,
+  language = "en-US",
+  includeAdult = false
+) {
+  const cacheKey = `discover_${type}_${year}_${language}_adult:${includeAdult}`;
+
+  if (tmdbDiscoverCache.has(cacheKey)) {
+    const cached = tmdbDiscoverCache.get(cacheKey);
+    return cached?.data || [];
+  }
+
+  const discoverType = type === "movie" ? "movie" : "tv";
+  const params = new URLSearchParams({
+    api_key: tmdbKey,
+    language,
+    include_adult: String(includeAdult),
+    sort_by: "vote_average.desc",
+    "vote_count.gte": "250",
+    page: "1",
+  });
+
+  if (discoverType === "movie") {
+    params.set("primary_release_year", String(year));
+  } else {
+    params.set("first_air_date_year", String(year));
+  }
+
+  const url = `${TMDB_API_BASE}/discover/${discoverType}?${params.toString()}`;
+
+  const payload = await withRetry(
+    async () => {
+      const response = await fetch(url);
+      if (!response.ok) {
+        const error = new Error(
+          `TMDB discover failed with status ${response.status}`
+        );
+        error.status = response.status;
+        throw error;
+      }
+      return response.json();
+    },
+    {
+      operationName: "TMDB discover context call",
+      maxRetries: 2,
+      initialDelay: 1000,
+      shouldRetry: (error) => !error.status || error.status >= 500,
+    }
+  );
+
+  const rows = (payload?.results || [])
+    .map((item) => {
+      const name = item.title || item.name;
+      const rawDate = item.release_date || item.first_air_date || "";
+      const parsedYear = parseInt(rawDate.slice(0, 4), 10);
+      if (!name || isNaN(parsedYear)) return null;
+      return {
+        id: item.id,
+        name,
+        year: parsedYear,
+        rating:
+          typeof item.vote_average === "number" ? item.vote_average : null,
+        votes: typeof item.vote_count === "number" ? item.vote_count : null,
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 20);
+
+  tmdbDiscoverCache.set(cacheKey, {
+    timestamp: Date.now(),
+    data: rows,
+  });
+
+  return rows;
+}
+
+function formatContextItems(items, maxItems = 8) {
+  return items.slice(0, maxItems).map((item) => {
+    const ratingText =
+      typeof item.rating === "number"
+        ? `TMDB ${item.rating.toFixed(1)}`
+        : "TMDB N/A";
+    return `- ${item.name} (${item.year}) | ${ratingText}`;
+  });
+}
+
+async function gatherExternalContextForQuery(
+  query,
+  type,
+  tmdbKey,
+  language = "en-US",
+  includeAdult = false
+) {
+  const sections = [];
+  const sources = [];
+  const sourceSet = new Set();
+  const yearHints = extractYearHintsFromQuery(query);
+
+  if (yearHints.length > 0) {
+    for (const year of yearHints) {
+      const discoverItems = await fetchTmdbDiscoverByYear(
+        type,
+        year,
+        tmdbKey,
+        language,
+        includeAdult
+      );
+
+      if (discoverItems.length > 0) {
+        sections.push(
+          `Top TMDB ${type} context for ${year} (high rating + vote count):`
+        );
+        sections.push(...formatContextItems(discoverItems, 6));
+        sections.push("");
+
+        for (const item of discoverItems.slice(0, 6)) {
+          const uri = `https://www.themoviedb.org/${
+            type === "movie" ? "movie" : "tv"
+          }/${item.id}`;
+          if (!sourceSet.has(uri)) {
+            sourceSet.add(uri);
+            sources.push({
+              title: item.name,
+              uri,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  const tmdbSearchResult = await searchTMDBExactMatch(
+    query,
+    type,
+    tmdbKey,
+    language,
+    includeAdult
+  );
+
+  if (tmdbSearchResult?.results?.length > 0) {
+    const searchRows = tmdbSearchResult.results
+      .slice(0, 10)
+      .map((item) => ({
+        id: item.id,
+        name: item.title || item.name,
+        year: parseInt(
+          (item.release_date || item.first_air_date || "").slice(0, 4),
+          10
+        ),
+        rating:
+          typeof item.vote_average === "number" ? item.vote_average : null,
+      }))
+      .filter((item) => item.name && !isNaN(item.year));
+
+    if (searchRows.length > 0) {
+      sections.push("TMDB title matches for this query:");
+      sections.push(...formatContextItems(searchRows, 8));
+      sections.push("");
+
+      for (const item of searchRows.slice(0, 8)) {
+        const uri = `https://www.themoviedb.org/${
+          type === "movie" ? "movie" : "tv"
+        }/${item.id}`;
+        if (!sourceSet.has(uri)) {
+          sourceSet.add(uri);
+          sources.push({
+            title: item.name,
+            uri,
+          });
+        }
+      }
+    }
+  }
+
+  return {
+    contextText: sections.join("\n").trim(),
+    yearHints,
+    sources,
+  };
+}
 
 // Add separate caches for raw and processed Trakt data
 const traktRawDataCache = new SimpleLRUCache({
@@ -2453,9 +2837,6 @@ function deserializeAllCaches(data) {
  * @returns {Promise<{type: string, genres: string[]}>} - The discovered type and genres
  */
 async function discoverTypeAndGenres(query, geminiKey, geminiModel) {
-  const genAI = new GoogleGenerativeAI(geminiKey);
-  const model = genAI.getGenerativeModel({ model: geminiModel });
-
   const promptText = `
 Analyze this recommendation query: "${query}"
 
@@ -2487,44 +2868,21 @@ Do not include any explanatory text before or after your response. Just the sing
       model: geminiModel,
     });
 
-    // Use withRetry for the Gemini API call
-    const text = await withRetry(
-      async () => {
-        try {
-          const aiResult = await model.generateContent(promptText);
-          const response = await aiResult.response;
-          const responseText = response.text().trim();
+    const { text } = await generateTextWithGenAI({
+      apiKey: geminiKey,
+      model: geminiModel,
+      promptText,
+      enableWebSearch: false,
+      operationName: "Genre discovery API call",
+      maxRetries: 3,
+      initialDelay: 2000,
+      maxDelay: 10000,
+    });
 
-          // Log successful response with more details
-          logger.info("Genre discovery API response", {
-            promptTokens: aiResult.promptFeedback?.tokenCount,
-            candidates: aiResult.candidates?.length,
-            safetyRatings: aiResult.candidates?.[0]?.safetyRatings,
-            responseTextLength: responseText.length,
-            responseTextSample: responseText,
-          });
-
-          return responseText;
-        } catch (error) {
-          // Enhance error with status for retry logic
-          logger.error("Genre discovery API call failed", {
-            error: error.message,
-            status: error.httpStatus || 500,
-            stack: error.stack,
-          });
-          error.status = error.httpStatus || 500;
-          throw error;
-        }
-      },
-      {
-        maxRetries: 3,
-        initialDelay: 2000,
-        maxDelay: 10000,
-        // Don't retry 400 errors (bad requests)
-        shouldRetry: (error) => !error.status || error.status !== 400,
-        operationName: "Genre discovery API call",
-      }
-    );
+    logger.info("Genre discovery API response", {
+      responseTextLength: text.length,
+      responseTextSample: text,
+    });
 
     // Extract the first line in case there's multiple lines
     const firstLine = text.split("\n")[0].trim();
@@ -2820,6 +3178,14 @@ const catalogHandler = async function (args, req) {
     }
     const enableAiCache =
       configData.EnableAiCache !== undefined ? configData.EnableAiCache : true;
+    const enableWebSearch =
+      configData.EnableWebSearch !== undefined
+        ? configData.EnableWebSearch
+        : DEFAULT_ENABLE_WEB_SEARCH;
+    const enableContextGathering =
+      configData.EnableContextGathering !== undefined
+        ? configData.EnableContextGathering
+        : DEFAULT_ENABLE_CONTEXT_GATHERING;
     // NEW: Read the EnableRpdb flag
     const enableRpdb =
       configData.EnableRpdb !== undefined ? configData.EnableRpdb : false;
@@ -2836,6 +3202,8 @@ const catalogHandler = async function (args, req) {
         isDefaultRpdbKey: rpdbKey === DEFAULT_RPDB_KEY,
         rpdbPosterType: rpdbPosterType,
         enableAiCache: enableAiCache,
+        enableWebSearch: enableWebSearch,
+        enableContextGathering: enableContextGathering,
         enableRpdb: enableRpdb,
         includeAdult: includeAdult,
         geminiModel: geminiModel,
@@ -3046,9 +3414,12 @@ const catalogHandler = async function (args, req) {
       }
     }
 
+    const freshnessKey = enableWebSearch
+      ? new Date().toISOString().slice(0, 10)
+      : "stable";
     const cacheKey = `${searchQuery}_${type}_${
       traktData ? "trakt" : "no_trakt"
-    }`;
+    }_web:${enableWebSearch ? 1 : 0}_ctx:${enableContextGathering ? 1 : 0}_fresh:${freshnessKey}`;
 
     // Only check cache if there's no Trakt data or if it's not a recommendation query
     if (
@@ -3200,10 +3571,38 @@ const catalogHandler = async function (args, req) {
     }
 
     try {
-      const genAI = new GoogleGenerativeAI(geminiKey);
-      const model = genAI.getGenerativeModel({ model: geminiModel });
       const genreCriteria = extractGenreCriteria(searchQuery);
       const currentYear = new Date().getFullYear();
+      let externalContextText = "";
+      let externalContextSources = [];
+
+      if (enableContextGathering) {
+        try {
+          const contextResult = await gatherExternalContextForQuery(
+            searchQuery,
+            type,
+            tmdbKey,
+            language,
+            includeAdult
+          );
+          externalContextText = contextResult.contextText;
+          externalContextSources = contextResult.sources;
+
+          logger.info("Context gathering completed", {
+            query: searchQuery,
+            type,
+            yearHints: contextResult.yearHints,
+            sourceCount: externalContextSources.length,
+            hasContextText: !!externalContextText,
+          });
+        } catch (contextError) {
+          logger.warn("Context gathering failed; continuing without context", {
+            query: searchQuery,
+            type,
+            error: contextError.message,
+          });
+        }
+      }
 
       let franchiseInstruction = `your TOP PRIORITY is to list ALL official mainline movies from that franchise, followed by any relevant spin-offs or related content.`;
 
@@ -3233,6 +3632,15 @@ const catalogHandler = async function (args, req) {
         promptText.push(`Mood/Style: ${genreCriteria.mood.join(", ")}`);
       }
       promptText.push("");
+
+      if (externalContextText) {
+        promptText.push(
+          "VERIFIED CONTEXT SNAPSHOT (FROM TMDB):",
+          externalContextText,
+          "Use this context to improve precision and year accuracy.",
+          ""
+        );
+      }
 
       if (traktData) {
         const { preferences } = traktData;
@@ -3499,47 +3907,37 @@ const catalogHandler = async function (args, req) {
         prompt: promptText,
         genreCriteria,
         numResults,
+        enableWebSearch,
+        enableContextGathering,
+        contextSourceCount: externalContextSources.length,
       });
 
-      // Use withRetry for the Gemini API call
-      const text = await withRetry(
-        async () => {
-          try {
-            const aiResult = await model.generateContent(promptText);
-            const response = await aiResult.response;
-            const responseText = response.text().trim();
-
-            logger.info("Gemini API response", {
-              duration: `${Date.now() - startTime}ms`,
-              promptTokens: aiResult.promptFeedback?.tokenCount,
-              candidates: aiResult.candidates?.length,
-              safetyRatings: aiResult.candidates?.[0]?.safetyRatings,
-              responseTextLength: responseText.length,
-              responseTextSample:
-                responseText.substring(0, 100) +
-                (responseText.length > 100 ? "..." : ""),
-            });
-
-            return responseText;
-          } catch (error) {
-            logger.error("Gemini API call failed", {
-              error: error.message,
-              status: error.httpStatus || 500,
-              stack: error.stack,
-            });
-            error.status = error.httpStatus || 500;
-            throw error;
-          }
-        },
-        {
+      const { text, groundingSources, usedWebSearch } =
+        await generateTextWithGenAI({
+          apiKey: geminiKey,
+          model: geminiModel,
+          promptText,
+          enableWebSearch,
+          operationName: "GenAI catalog recommendation call",
           maxRetries: 3,
           initialDelay: 2000,
           maxDelay: 10000,
-          // Don't retry 400 errors (bad requests)
-          shouldRetry: (error) => !error.status || error.status !== 400,
-          operationName: "Gemini API call",
-        }
-      );
+        });
+
+      logger.info("Gemini API response", {
+        duration: `${Date.now() - startTime}ms`,
+        responseTextLength: text.length,
+        responseTextSample:
+          text.substring(0, 100) + (text.length > 100 ? "..." : ""),
+        usedWebSearch,
+        groundingSourceCount: groundingSources.length,
+      });
+
+      if (groundingSources.length > 0 && ENABLE_LOGGING) {
+        logger.debug("Gemini grounding sources", {
+          sources: groundingSources.slice(0, 8),
+        });
+      }
 
       // Process the response text
       const lines = text
@@ -3951,6 +4349,10 @@ const metaHandler = async function (args) {
       }
       const configData = JSON.parse(decryptedConfigStr);
       const { GeminiApiKey, TmdbApiKey, GeminiModel, NumResults, RpdbApiKey, RpdbPosterType, TmdbLanguage, FanartApiKey } = configData;
+      const enableWebSearch =
+        configData.EnableWebSearch !== undefined
+          ? configData.EnableWebSearch
+          : DEFAULT_ENABLE_WEB_SEARCH;
 
       const originalId = id.split(':')[1];
       
@@ -4015,22 +4417,24 @@ const metaHandler = async function (args) {
       movie|Prisoners|2013
       `;
 
-      const genAI = new GoogleGenerativeAI(GeminiApiKey);
-      const model = genAI.getGenerativeModel({ model: GeminiModel || DEFAULT_GEMINI_MODEL });
-      
-      const aiResult = await withRetry(
-        async () => {
-          return await model.generateContent(promptText);
-        },
-        {
+      const { text: responseText, groundingSources, usedWebSearch } =
+        await generateTextWithGenAI({
+          apiKey: GeminiApiKey,
+          model: GeminiModel || DEFAULT_GEMINI_MODEL,
+          promptText,
+          enableWebSearch,
+          operationName: "GenAI similar content call",
           maxRetries: 3,
-          baseDelay: 1000,
-          shouldRetry: (error) => !error.status || error.status !== 400,
-          operationName: "Gemini API call (similar content)"
-        }
-      );
-      
-      const responseText = aiResult.response.text().trim();
+          initialDelay: 1000,
+          maxDelay: 10000,
+        });
+
+      logger.info("Similar content GenAI response received", {
+        originalId,
+        type,
+        usedWebSearch,
+        groundingSourceCount: groundingSources.length,
+      });
       const lines = responseText.split('\n').map(line => line.trim()).filter(Boolean);
 
       const videoPromises = lines.map(async (line) => {

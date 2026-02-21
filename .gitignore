@@ -2,6 +2,7 @@
 node_modules/
 package-lock.json
 
+cache_data/
 # Environment variables
 .env
 

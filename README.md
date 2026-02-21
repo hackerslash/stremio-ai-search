@@ -458,7 +458,7 @@ Here are some examples showing how versatile this addon is.
 
 When self-hosting the addon, you can configure the following environment variables in a `.env` file:
 
-- `HOST` - Your domain/hostname without protocol (e.g., `example.com` or `localhost:7000`)
+- `HOST` - Your domain/hostname without protocol (e.g., `example.com` or `localhost:6295`)
 - `TRAKT_CLIENT_ID` - Your Trakt API client ID
 - `TRAKT_CLIENT_SECRET` - Your Trakt API client secret
 - `ENCRYPTION_KEY` - Key used for encrypting sensitive configuration data
